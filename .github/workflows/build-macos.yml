@@ -1,0 +1,135 @@
+name: Build Aseprite for macOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      aseprite_branch:
+        description: "Aseprite branch or tag to build"
+        required: true
+        default: "main"
+      runner:
+        description: "macOS runner to use"
+        required: true
+        type: choice
+        options:
+          - macos-latest
+          - macos-14
+          - macos-13
+        default: "macos-latest"
+      build_type:
+        description: "CMake build type"
+        required: true
+        type: choice
+        options:
+          - RelWithDebInfo
+          - Release
+          - Debug
+        default: "RelWithDebInfo"
+
+jobs:
+  build-macos:
+    runs-on: ${{ github.event.inputs.runner }}
+    env:
+      DEPS_DIR: ${{ github.workspace }}/deps
+
+    steps:
+      - name: Log tool versions
+        run: |
+          echo "os: $(uname -s) $(uname -r)"
+          echo "arch: $(uname -m)"
+          xcode-select -p
+          xcrun --sdk macosx --show-sdk-path
+          cmake --version
+          ninja --version
+          clang --version
+
+      - name: Install/update tools
+        run: |
+          set -e
+          if ! cmake --version >/dev/null 2>&1 || ! ninja --version >/dev/null 2>&1; then
+            brew install cmake ninja
+          fi
+
+      - name: Checkout Aseprite
+        uses: actions/checkout@v7
+        with:
+          repository: aseprite/aseprite
+          ref: ${{ github.event.inputs.aseprite_branch }}
+          submodules: recursive
+          path: aseprite
+
+      - name: Set architecture variables
+        id: vars
+        run: |
+          set -e
+          ARCH=$(uname -m)
+          if [ "$ARCH" = "x86_64" ]; then
+            echo "skia_arch=x64" >> $GITHUB_OUTPUT
+            echo "osx_arch=x86_64" >> $GITHUB_OUTPUT
+            echo "osx_target=10.14" >> $GITHUB_OUTPUT
+          elif [ "$ARCH" = "arm64" ]; then
+            echo "skia_arch=arm64" >> $GITHUB_OUTPUT
+            echo "osx_arch=arm64" >> $GITHUB_OUTPUT
+            echo "osx_target=11.0" >> $GITHUB_OUTPUT
+          else
+            echo "Unsupported architecture: $ARCH" >&2
+            exit 1
+          fi
+
+      - name: Download prebuilt Skia
+        run: |
+          set -e
+          mkdir -p "$DEPS_DIR"
+          SKIA_TAG=$(cat aseprite/laf/misc/skia-tag.txt)
+          echo "Using Skia tag: $SKIA_TAG"
+          SKIA_URL="https://github.com/aseprite/skia/releases/download/${SKIA_TAG}/Skia-macOS-Release-${{ steps.vars.outputs.skia_arch }}.zip"
+          echo "Downloading $SKIA_URL"
+          curl -fsSL --retry 3 -o "$DEPS_DIR/skia.zip" "$SKIA_URL"
+          mkdir -p "$DEPS_DIR/skia"
+          unzip -q "$DEPS_DIR/skia.zip" -d "$DEPS_DIR/skia"
+          echo "Skia contents:"
+          find "$DEPS_DIR/skia" -maxdepth 3 -type d
+      - name: Configure Aseprite
+        run: |
+          set -e
+          cmake -B aseprite/build -S aseprite -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ github.event.inputs.build_type }} \
+            -DCMAKE_OSX_ARCHITECTURES=${{ steps.vars.outputs.osx_arch }} \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=${{ steps.vars.outputs.osx_target }} \
+            -DCMAKE_OSX_SYSROOT=$(xcrun --sdk macosx --show-sdk-path) \
+            -DLAF_BACKEND=skia \
+            -DSKIA_DIR="$DEPS_DIR/skia" \
+            -DSKIA_LIBRARY_DIR="$DEPS_DIR/skia/out/Release-${{ steps.vars.outputs.skia_arch }}" \
+            -DSKIA_LIBRARY="$DEPS_DIR/skia/out/Release-${{ steps.vars.outputs.skia_arch }}/libskia.a" \
+            -DPNG_ARM_NEON:STRING=${{ steps.vars.outputs.osx_arch == 'arm64' && 'on' || 'off' }}
+
+      - name: Build Aseprite
+        run: |
+          set -e
+          cmake --build aseprite/build --target aseprite
+
+      - name: Package Aseprite
+        run: |
+          set -e
+          cd aseprite/build/bin
+          if [ -d "Aseprite.app" ]; then
+            echo "Aseprite.app found, zipping directly"
+            zip -r Aseprite-macos.zip Aseprite.app
+          else
+            echo "Creating Aseprite.app bundle"
+            mkdir -p Aseprite.app/Contents/MacOS
+            mkdir -p Aseprite.app/Contents/Resources
+            cp aseprite Aseprite.app/Contents/MacOS/
+            cp -R data Aseprite.app/Contents/Resources/
+            if [ -f aseprite.ini ]; then
+              cp aseprite.ini Aseprite.app/Contents/Resources/
+            fi
+            printf '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0">\n<dict>\n    <key>CFBundleExecutable</key>\n    <string>aseprite</string>\n    <key>CFBundleIdentifier</key>\n    <string>org.aseprite.app</string>\n    <key>CFBundleName</key>\n    <string>Aseprite</string>\n    <key>CFBundlePackageType</key>\n    <string>APPL</string>\n    <key>CFBundleShortVersionString</key>\n    <string>1.0</string>\n</dict>\n</plist>\n' > Aseprite.app/Contents/Info.plist
+            zip -r Aseprite-macos.zip Aseprite.app
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: aseprite-macos-${{ steps.vars.outputs.skia_arch }}-${{ github.run_id }}
+          path: aseprite/build/bin/Aseprite-macos.zip
